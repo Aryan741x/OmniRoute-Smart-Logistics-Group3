@@ -53,6 +53,10 @@ def fuel_efficiency_audit():
         col("fuel_type")
     ).dropDuplicates(["vin"])
 
+    registry_df = registry_df.filter(
+        col("fuel_type").isNotNull()
+    )
+
     assignment_df = spark.read.format("delta").load(ASSIGNMENT_PATH).select(
         upper(trim(col("vin"))).alias("vin"),
         col("driver_id"),

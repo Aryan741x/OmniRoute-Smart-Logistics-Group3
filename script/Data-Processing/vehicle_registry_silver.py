@@ -53,7 +53,17 @@ def registry_silver():
         (col("mfg_year") > lit(current_year))
     )
 
-    valid_df = df.subtract(invalid_core_df)
+    valid_df = df.filter(
+        col("vin").isNotNull() &
+        (col("vin") != "") &
+        col("model").isNotNull() &
+        (col("model") != "") &
+        col("fuel_type").isNotNull() &
+        (col("fuel_type") != "") &
+        col("mfg_year").isNotNull() &
+        (length(col("vin")) == 8) &
+        (col("mfg_year") <= lit(current_year))
+    )
 
     invalid_vin_len_count = invalid_core_df.filter(length(col("vin")) != 8).count()
     invalid_year_count = invalid_core_df.filter(col("mfg_year") > lit(current_year)).count()
