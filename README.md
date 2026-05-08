@@ -1,74 +1,101 @@
-# OmniRoute Smart Logistics Engine - Data Pipeline
+# OmniRoute Smart Logistics Engine
 
-A robust, cloud-native data pipeline built for the OmniRoute Logistics platform. It ingests, transforms, and exports telemetry and operational data regarding vehicle assignments, fuel transactions, maintenance logs, and asset registries. 
+## Overview
+This repository implements a **production-ready, idempotent data pipeline** for the OmniRoute Smart Logistics Engine. The pipeline processes both **Batch** and **Real-Time Streaming** data to manage fleet operations, ensure driver safety, and automate financial audits. It utilizes a Bronze → Silver → Gold (Delta Lake) architecture on AWS, orchestrated by Apache Airflow.
 
-The pipeline employs a **Medallion Architecture (Bronze, Silver, Gold)** using **Apache Spark** and **Delta Lake** on **AWS EMR**, orchestrated via **Apache Airflow**, and ultimately syncs aggregated business metrics incrementally into a **PostgreSQL** data warehouse.
+## Business Requirements Document (BRD) - Key Specifications
+The "Enhancing Logistics Engine with New Features" document defines the following core logic:
 
-## 🏗️ Architecture & AWS Setup
+### 1. Batch Processing Schedule
+- **Daily @ 00:00 UTC**: Vehicle Registry & Assignment (Incremental Updates).
+- **Daily @ 07:00 UTC**: Fuel Transactions (Efficiency Audit).
+- **Monthly @ 1st of month**: Driver Standing Report & Salary Cooldown.
+- **Yearly @ Jan 1st**: Maintenance Schedule ingestion.
 
-### 1. Storage & Computation
-* **Amazon S3**: Acts as the central data lake. Data is logically partitioned into Bronze, Silver, and Gold buckets.
-* **Amazon EMR**: Used for distributed data processing. Airflow provisions **ephemeral** EMR clusters (`m5a.xlarge`) dynamically on-demand, executing Spark scripts directly from S3, and tearing down the cluster to optimize costs once complete.
+### 2. Real-Time Streaming Logic (Kafka)
+- **Violation Detection**: Flags vehicles exceeding **110 km/h** or entering coordinates defined in `restricted_zones.json`.
+- **Penalty System**: A "Safety Strike" results in a **5% deduction** from the driver's `daily_rate`.
+- **Suspension**: Drivers hitting **10 strikes** are moved to `SUSPENDED` status and blocked from the fleet.
+- **Monthly Cooldown**: On the 1st of each month, strike counts reset to 0 and rates are restored (for non-suspended drivers).
 
-### 2. Orchestration (Apache Airflow)
-* Dynamically manages the lifecycle of the AWS EMR clusters.
-* Leverages advanced **time-based routing** logic to execute different segments of the pipeline according to distinct SLA schedules.
-* Integrates directly with Boto3 (`AwsBaseHook`) to query EC2 states and ensure upstream dependencies (e.g., PostgreSQL instance) are active.
-* Emails monthly reports to stakeholders via the `EmailOperator`.
+## Architecture
+The system is built on **AWS** and orchestrated by **Apache Airflow**:
+- **Batch Layer**: Ephemeral EMR clusters running Spark jobs on S3 Delta Lake.
+- **Streaming Layer**: Spark Streaming/Flink ingesting Kafka telemetry for real-time safety flagging.
+- **Database**: PostgreSQL (EC2) with Change-Data-Feed (CDF) for efficient incremental exports.
 
-### 3. Data Warehouse (PostgreSQL)
-* Hosted on a dedicated EC2 instance within the VPC. 
-* To reduce costs, the EC2 instance is kept stopped. The Airflow DAG auto-starts the instance and dynamically retrieves its Private IP before spinning up the Spark jobs.
-* Sinks aggregated metrics using PySpark JDBC connections.
+```mermaid
+flowchart TD
+    subgraph Ingestion["Source Layer"]
+        K1[("Kafka Telemetry Stream")]
+        S3B[("S3 Landing Zone (CSVs)")]
+    end
 
----
+    subgraph Processing["Processing Layer (EMR)"]
+        direction TB
+        B1["Bronze (Raw Data)"]
+        S1["Silver (Cleansed/SCD2)"]
+        G1["Gold (Business Aggr)"]
+        ST1["Streaming Engine (Safety Logic)"]
+    end
 
-## 🔁 Medallion Data Flow
+    subgraph Storage["Storage & Warehouse"]
+        DL[("Delta Lake (S3)")]
+        PG[("PostgreSQL (Export)")]
+    end
 
-### 🥉 Bronze Layer (Ingestion)
-Reads raw, unstructured data and writes it to the Bronze S3 bucket.
-* **Vehicle Registry**: Master dimension table.
-* **Vehicle Assignment**: Tracks driver transitions and pay rates.
-* **Maintenance Logs**: Represents mandatory downtime.
-* **Fuel Transactions**: Logs actual fuel usage to calculate efficiency.
+    K1 --> ST1
+    S3B --> B1
+    B1 --> S1 --> G1
+    ST1 --> DL
+    G1 --> DL
+    DL -- CDF Upsert --> PG
+    
+    subgraph Orchestration["Airflow Control"]
+        A1["EC2 Control"]
+        A2["EMR Lifecycle"]
+        A3["Branching Logic"]
+    end
+```
 
-### 🥈 Silver Layer (Processing & Cleansing)
-Transforms Bronze data into highly reliable Delta tables.
-* Drops duplicates and null values.
-* Casts Unix timestamps to native Date/Timestamp formats.
-* Resolves incremental data continuity and schema validations.
+## Data Model & Relationships
 
-### 🥇 Gold Layer (Aggregations)
-Business-ready datasets utilizing advanced Delta Lake features.
-* **Active Fleet Snapshot**: A point-in-time daily overwrite table aggregating the count of active vehicles per model.
-* **Asset History (SCD Type 2)**: Tracks changes in vehicle assignment over time using Delta `MERGE` statements.
-* **Fuel Efficiency Audit**: Calculates fuel efficiency metrics, identifying anomalies.
-* **Monthly Driver Standing**: Summarizes driver performance on the 1st of every month.
+| Layer | Dataset | Description | Key Columns | Frequency |
+| :--- | :--- | :--- | :--- | :--- |
+| **Bronze** | `vehicle_registry` | Raw vehicle catalog snapshot | `vin`, `model`, `fuel_type` | Daily |
+| | `vehicle_assignment` | Incremental driver-vehicle mapping | `vin`, `driver_id`, `daily_rate` | Daily |
+| | `fuel_transactions` | Logs for efficiency calculations | `vin`, `fuel_liters`, `odometer` | Daily |
+| | `telemetry_stream` | **Kafka JSON** real-time events | `vin`, `speed`, `lat`, `long` | Real-time |
+| **Silver** | `asset_history` | **SCD Type 2** tracking of driver swaps | `vin`, `driver_id`, `effective_to` | Batch |
+| | `clensed_telemetry`| Filtered safety violations | `vin`, `strike_type`, `ts` | Streaming |
+| **Gold** | `vehicle_gold` | Asset History with salary adjustments | `vin`, `current_adjusted_rate` | Batch |
+| | `fuel_audit` | Efficiency vs 12% Threshold | `vin`, `flag`, `distance` | Daily |
+| | `driver_standing` | Performance ranking & strike reset | `driver_id`, `strike_count` | Monthly |
 
-### 📤 Export Layer (PostgreSQL Sync)
-A specialized Spark job that pushes data from Gold Delta tables into PostgreSQL.
-* Utilizes **Delta Lake's Change Data Feed (CDF)** to perform highly efficient **incremental upserts** instead of full table scans.
-* Maintains state securely in an S3 `state.json` file to guarantee idempotency across DAG runs.
+## Core Business Logic Scenarios
 
----
+### 1. SCD Type 2 & Continuity
+Handles "Driver Swaps" by closing old records (status: ARCHIVED) and opening new ones (status: IN-TRANSIT) to ensure no historical rate data is lost.
 
-## ⏱️ Scheduling Requirements (BRD)
+### 2. Conflict Resolution: "Highest Rate" Rule
+If multiple records arrive for the same vehicle in one day, the system uses window functions to prioritize the record with the **Highest Daily Rate**.
 
-The DAG implements complex branching (`BranchPythonOperator`) to adhere to the following business logic rules based on logical execution time:
+### 3. Efficiency Auditing (12% Rule)
+Flags vehicles where `Distance / Fuel` is 12% lower than the model's baseline. **Exclusion logic**: Sunday fuel or maintenance days are ignored to avoid penalizing idling.
 
-| Data Subject | Execution Schedule (UTC) | Action |
-|---|---|---|
-| **Registry & Assignment** | Daily @ 00:00 | Process Bronze → Silver → Gold (Asset History & Fleet Snapshot). |
-| **Fuel Transactions** | Daily @ 07:00 | Process Bronze → Silver → Gold (Fuel Efficiency Audit). |
-| **Maintenance Logs** | Yearly on Jan 1 | Process Bronze → Silver. |
-| **Driver Standing** | 1st of every Month | Process Gold Monthly Standing → Export Report & Email. |
-| **PostgreSQL Export** | End of paths | Incrementally sink processed data. |
+### 4. Safety Strike Penalty
+If a streaming event triggers a strike:
+`Current Adjusted Rate = Base Rate * 0.95`
+Deductions are cumulative until the monthly reset.
 
-## 🚀 Setup & Execution
+## Setup & Execution
 
-1. **Upload Scripts to S3**: All PySpark processing scripts (e.g., `vehicle_gold.py`, `postgres_export.py`, `config.py`) must be uploaded to the target Silver scripts bucket.
-2. **Airflow Variables**: Configure the required Airflow Variables:
-   * `postgres_ec2_id` (The instance ID for the DB server)
-   * `pg_port`, `pg_user`, `pg_password`, `pg_db`
-   * `EMAIL_TO` (for monthly standing reports)
-3. **Execution**: The DAG `omniroute_batch_final` runs automatically via Airflow's scheduler. For manual testing, you can use the "Trigger DAG w/ config" feature and pass a JSON like `{"pipeline_stage": "midnight"}` or modify the `Logical date` to simulate different time scenarios.
+### 1. Batch Execution
+1.  **Configure Airflow Variables**: `pg_host`, `pg_port`, `pg_db`, `postgres_ec2_id`.
+2.  **Upload Scripts**: Sync the `script/` folder to S3.
+3.  **Trigger**: Run `omniroute_batch_final` via Airflow.
+
+### 2. Streaming Execution
+1.  **Start Kafka Producers**: Ensure telemetry is flowing to the configured topic.
+2.  **Submit Streaming Job**: Run the Spark Streaming job to begin stateful safety processing.
+
