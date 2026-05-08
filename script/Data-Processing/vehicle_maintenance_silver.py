@@ -19,14 +19,10 @@ def vehicle_maintenance_silver():
     
     print("=== Starting Vehicle Maintenance Silver Processing ===")
 
-    # -------------------------------
-    # Read Bronze (Parquet)
-    # -------------------------------
+    # Load the raw maintenance records from the Bronze Delta table.
     bronze_df = spark.read.format("delta").load(INPUT_PATH)
 
-    # -------------------------------
-    # Casting + Cleaning strings
-    # -------------------------------
+    # Standardize formats: ensure VINs are uppercase and parse strings into proper date objects.
     df = bronze_df \
         .withColumn("vin", upper(trim(col("vin")))) \
         .withColumn("service_date", to_date(col("service_date"))) \
@@ -34,10 +30,8 @@ def vehicle_maintenance_silver():
 
     common_cols = ["vin", "service_date", "service_type", "error_reason"]
 
-    # -------------------------------
-    # Step 1: Null or Invalid Keys
-    # -------------------------------
-    # If service_date was an invalid string, to_date will make it null.
+    # Step 1: Identify and separate records with missing or invalid critical fields.
+    # Note: If 'service_date' was an unparseable string, it becomes null here and gets caught.
     null_key_df = df.filter(
         col("vin").isNull() | 
         (col("vin") == "") |
@@ -50,11 +44,9 @@ def vehicle_maintenance_silver():
         col("service_date").isNotNull()
     )
 
-    # -------------------------------
-    # Step 2: Duplicates (Exact Match)
-    # -------------------------------
-    # If the same vehicle has the same service on the same date multiple times,
-    # keep the most recent one (based on ingestion_time) and send the rest to errors.
+    # Step 2: Deduplicate records.
+    # If a vehicle has multiple entries for the exact same service on the same date,
+    # we only keep the one that was ingested most recently.
     dup_window = Window.partitionBy("vin", "service_date", "service_type").orderBy(desc("ingestion_time"))
     
     ranked_df = valid_df.withColumn("rn", row_number().over(dup_window))
@@ -65,21 +57,16 @@ def vehicle_maintenance_silver():
 
     clean_df = ranked_df.filter(col("rn") == 1).drop("rn")
 
-    # -------------------------------
-    # Combine Errors
-    # -------------------------------
+    # Aggregate all the problematic records found during validation.
     error_df = null_key_df \
         .unionByName(dup_records, allowMissingColumns=True) \
         .select(common_cols)
 
-    # -------------------------------
-    # Write SILVER
-    # -------------------------------
-    
-    # Write errors
+    # Save the invalid records to our error tracking table.
     error_df.write.format("delta").mode("append").save(ERROR_PATH)
 
-    # Write clean data partitioned by year and month of service_date for efficiency
+    # Extract year and month to use as partition keys, which drastically speeds up historical queries.
+    # Then, upsert the clean data into the primary Silver table.
     clean_df = clean_df \
         .withColumn("service_year", year(col("service_date"))) \
         .withColumn("service_month", month(col("service_date")))
@@ -100,8 +87,7 @@ def vehicle_maintenance_silver():
          .whenNotMatchedInsertAll() \
          .execute()
 
-    # -------------------------------
-    # Delta Lake Maintenance
+    # Perform regular Delta Lake maintenance to compact files, apply Z-Ordering, and clear out stale data.
     logger.info("Running OPTIMIZE and VACUUM on Silver Maintenance tables...")
     DeltaTable.forPath(spark, ERROR_PATH).optimize().executeCompaction()
     DeltaTable.forPath(spark, ERROR_PATH).vacuum(168.0)
@@ -114,7 +100,7 @@ def vehicle_maintenance_silver():
     c_count = clean_df.count()
     e_count = error_df.count()
     
-    print("✅ Vehicle Maintenance Silver complete")
+    print("Vehicle Maintenance Silver complete")
     print(f"   Clean records: {c_count:,}")
     print(f"   Error records: {e_count:,}")
 

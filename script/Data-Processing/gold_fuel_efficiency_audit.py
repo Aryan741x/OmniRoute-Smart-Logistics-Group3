@@ -6,9 +6,7 @@ from pyspark.sql.window import Window
 from spark_helper import get_spark
 from config import SILVER_FUEL_DISTANCE as DISTANCE_PATH, SILVER_REGISTRY as REGISTRY_PATH, SILVER_ASSIGNMENT as ASSIGNMENT_PATH, SILVER_MAINT_CLEAN as MAINTENANCE_PATH, GOLD_FUEL_AUDIT as GOLD_PATH
 from delta.tables import DeltaTable
-# -------------------------------
-# Spark Session
-# -------------------------------
+# Initialize the Spark session for the Gold layer fuel efficiency audit.
 spark = get_spark("Gold - Fuel Efficiency Audit")
 
 import logging
@@ -19,9 +17,7 @@ def fuel_efficiency_audit():
 
     print("=== Starting Gold - Fuel Efficiency Audit ===")
 
-    # =========================================
-    # 0. Precondition: Verify required Silver tables exist
-    # =========================================
+    # Step 0: Ensure all prerequisite Silver tables are available before starting the audit.
     required_tables = {
         "Fuel Distance": DISTANCE_PATH,
         "Vehicle Registry": REGISTRY_PATH,
@@ -29,14 +25,12 @@ def fuel_efficiency_audit():
     }
     for name, path in required_tables.items():
         if not DeltaTable.isDeltaTable(spark, path):
-            msg = (f"❌ Required table '{name}' not found at {path}. "
+            msg = (f"Required table '{name}' not found at {path}. "
                    f"Cannot run fuel efficiency audit.")
             logger.error(msg)
             raise RuntimeError(msg)
 
-    # =========================================
-    # 1. Load all Silver tables
-    # =========================================
+    # Step 1: Load data from our Silver layer tables.
     dist_df = spark.read.format("delta").load(DISTANCE_PATH).select(
         upper(trim(col("vin"))).alias("vin"),
         col("timestamp"),
@@ -46,16 +40,12 @@ def fuel_efficiency_audit():
         to_date(col("timestamp")).alias("txn_date")
     )
 
-    # Small tables → broadcast for performance
+    # Load registry and assignment data. These tables are small enough to be broadcasted to all worker nodes to speed up joins.
     registry_df = spark.read.format("delta").load(REGISTRY_PATH).select(
         upper(trim(col("vin"))).alias("vin"),
         col("model"),
         col("fuel_type")
     ).dropDuplicates(["vin"])
-
-    registry_df = registry_df.filter(
-        col("fuel_type").isNotNull()
-    )
 
     assignment_df = spark.read.format("delta").load(ASSIGNMENT_PATH).select(
         upper(trim(col("vin"))).alias("vin"),
@@ -65,7 +55,7 @@ def fuel_efficiency_audit():
         col("status")
     )
 
-    # Non-critical: maintenance (used only for exclusion)
+    # Load maintenance data if available. This isn't critical, but we use it to avoid penalizing drivers if their vehicle was in the shop.
     maintenance_df = None
     if DeltaTable.isDeltaTable(spark, MAINTENANCE_PATH):
         maintenance_df = spark.read.format("delta").load(MAINTENANCE_PATH).select(
@@ -73,9 +63,9 @@ def fuel_efficiency_audit():
             col("service_date")
         ).distinct()
     else:
-        logger.warning("⚠️  Maintenance table not found — will skip maintenance day exclusion")
+        logger.warning("Maintenance table not found — will skip maintenance day exclusion")
 
-    # Count & validate — skip if primary data is empty
+    # Check our row counts to ensure we actually have data to process.
     dist_count = dist_df.count()
     reg_count = registry_df.count()
     asg_count = assignment_df.count()
@@ -87,23 +77,20 @@ def fuel_efficiency_audit():
     print(f"   Maintenance records: {maint_count:,}")
 
     if dist_count == 0:
-        msg = "❌ No fuel distance records found. Nothing to audit."
+        msg = "No fuel distance records found. Nothing to audit."
         logger.error(msg)
         raise RuntimeError(msg)
     if reg_count == 0:
-        msg = "❌ Registry is empty. Cannot validate VINs."
+        msg = " Registry is empty. Cannot validate VINs."
         logger.error(msg)
         raise RuntimeError(msg)
     if asg_count == 0:
-        msg = "❌ Assignment table is empty. Cannot validate drivers."
+        msg = "Assignment table is empty. Cannot validate drivers."
         logger.error(msg)
         raise RuntimeError(msg)
 
-    # =========================================
-    # 2. JOIN 1 - Validate VIN exists in registry
-    #    (Removes ghost/phantom vehicles)
-    #    BROADCAST registry (20K rows, ~small)
-    # =========================================
+    # Step 2: Cross-reference with the vehicle registry.
+    # This filters out any "ghost" vehicles that show up in the fuel logs but aren't in our official system.
     validated_df = dist_df.join(
         broadcast(registry_df),
         on="vin",
@@ -113,15 +100,12 @@ def fuel_efficiency_audit():
     print(f"   After registry join (ghost VINs removed): {after_registry:,}")
 
     if after_registry == 0:
-        msg = "❌ No records survived registry join (no matching VINs). Cannot proceed."
+        msg = "No records survived registry join (no matching VINs). Cannot proceed."
         logger.error(msg)
         raise RuntimeError(msg)
 
-    # =========================================
-    # 3. JOIN 2 - Validate VIN has active assignment
-    #    (Removes shadow drivers / unassigned vehicles)
-    #    Match: txn_date falls between assignment start_date and end_date
-    # =========================================
+    # Step 3: Check against vehicle assignments.
+    # We only want to audit vehicles that were officially assigned to a driver on the day they were fueled.
     validated_df = validated_df.join(
         broadcast(assignment_df),
         on=[
@@ -136,25 +120,18 @@ def fuel_efficiency_audit():
     print(f"   After assignment join (shadow drivers removed): {after_assignment:,}")
 
     if after_assignment == 0:
-        msg = "❌ No records survived assignment join. Cannot proceed."
+        msg = " No records survived assignment join. Cannot proceed."
         logger.error(msg)
         raise RuntimeError(msg)
 
-    # =========================================
-    # 4. Exclude Weekends (dayofweek: 1=Sun, 7=Sat)
-    # =========================================
+    # Step 4: Ignore weekend fuel-ups, as driving patterns and rules may differ on Saturdays and Sundays.
     validated_df = validated_df.filter(
         ~dayofweek(col("txn_date")).isin(1, 7)
     )
     after_weekend = validated_df.count()
     print(f"   After weekend exclusion: {after_weekend:,}")
 
-    # =========================================
-    # 5. JOIN 3 - Exclude Maintenance Days
-    #    (Driver shouldn't be penalized for idling at workshop)
-    #    BROADCAST maintenance (33K rows, ~small)
-    #    Non-critical: if maintenance data is missing, skip exclusion
-    # =========================================
+    # Step 5: Filter out any days where the vehicle was recorded as being in the shop for maintenance.
     if maintenance_df is not None and maint_count > 0:
         validated_df = validated_df.join(
             broadcast(maintenance_df),
@@ -167,13 +144,11 @@ def fuel_efficiency_audit():
         after_maint = validated_df.count()
         print(f"   After maintenance exclusion: {after_maint:,}")
     else:
-        logger.warning("⚠️  Skipping maintenance exclusion (no maintenance data available)")
+        logger.warning(" Skipping maintenance exclusion (no maintenance data available)")
         print("   Maintenance exclusion: SKIPPED (no data)")
 
-    # =========================================
-    # 6. Aggregate: daily mileage per VIN
-    #    (A vehicle may have multiple fill-ups per day)
-    # =========================================
+    # Step 6: Calculate total fuel and distance per vehicle for each day.
+    # This aggregates multiple fill-ups that might happen on the same day.
     daily_df = validated_df.groupBy("vin", "model", "fuel_type","txn_date").agg(
         sum("distance").alias("total_distance"),
         sum("fuel_liters").alias("total_fuel")
@@ -184,18 +159,9 @@ def fuel_efficiency_audit():
         round(col("total_distance") / col("total_fuel"), 4)
     )
 
-    # =========================================
-    # 7. 30-Day Rolling Median Baseline Per Model
-    #
-    #    Why median instead of mean?
-    #    - The mileage data is skewed (outliers from
-    #      highway vs city driving). Median is robust
-    #      to these outliers and gives a fairer baseline.
-    #
-    #    How: percentile_approx(col, 0.5) = median
-    #    Window: all records for the same MODEL within
-    #    the past 30 days (excluding the current day).
-    # =========================================
+    # Step 7: Establish a fair fuel efficiency baseline.
+    # We calculate a 30-day rolling median for each vehicle model.
+    # The median is used instead of the average to prevent extreme outliers (like unusual highway trips) from skewing the baseline.
     baseline_window = Window.partitionBy("model","fuel_type") \
         .orderBy(unix_date(col("txn_date"))) \
         .rangeBetween(-30, -1)
@@ -205,10 +171,8 @@ def fuel_efficiency_audit():
         round(percentile_approx(col("km_per_liter"), 0.5).over(baseline_window), 4)
     )
 
-    # =========================================
-    # 8. Flag: FLAGGED if km_per_liter < baseline * 0.88
-    #    (i.e., 12% worse than the model median)
-    # =========================================
+    # Step 8: Evaluate the daily efficiency against the baseline.
+    # A vehicle is flagged for audit if its efficiency drops below 88% of its model's median (a 12% drop).
     audit_df = daily_df.withColumn(
         "status",
         when(col("km_per_liter").isNull(), lit("INSUFFICIENT_DATA"))
@@ -217,26 +181,21 @@ def fuel_efficiency_audit():
         .otherwise(lit("OK"))
     )
 
-    # =========================================
-    # 9. Final output columns (per BRD)
-    # =========================================
+    # Step 9: Format our final output dataset to include only the required columns.
     gold_df = audit_df.select(
         col("vin"),
         col("model"),
-        col("fuel_type"),
         col("txn_date").alias("audit_date"),
         col("km_per_liter"),
         col("baseline_kmpl"),
-        col("status")
+        col("status"),
+        col("fuel_type"),
     )
 
-    # =========================================
-    # 10. Write to Gold Layer (Merge)
-    # =========================================
+    # Step 10: Upsert the audit results into the Gold Delta table.
     if not DeltaTable.isDeltaTable(spark, GOLD_PATH):
         logger.info(f"Creating {GOLD_PATH}...")
         gold_df.write.format("delta").mode("overwrite") \
-            .partitionBy("status") \
             .save(GOLD_PATH)
         spark.sql(f"ALTER TABLE delta.`{GOLD_PATH}` SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
     else:
@@ -249,19 +208,17 @@ def fuel_efficiency_audit():
          .whenNotMatchedInsertAll() \
          .execute()
 
-    # Delta Lake Maintenance
+    # Optimize the Gold table structure for querying and remove obsolete files.
     DeltaTable.forPath(spark, GOLD_PATH).optimize().executeZOrderBy("vin", "audit_date")
     DeltaTable.forPath(spark, GOLD_PATH).vacuum(168.0)
 
-    # =========================================
-    # 11. Summary
-    # =========================================
+    # Final step: Print a summary report of the audit results to the console.
     total   = gold_df.count()
     flagged = gold_df.filter(col("status") == "FLAGGED").count()
     ok      = gold_df.filter(col("status") == "OK").count()
     insuf   = gold_df.filter(col("status") == "INSUFFICIENT_DATA").count()
 
-    print(f"\n✅ Fuel Efficiency Audit Gold complete")
+    print(f"\nFuel Efficiency Audit Gold complete")
     print(f"   Total audit records:    {total:,}")
     print(f"   FLAGGED:                {flagged:,}")
     print(f"   OK:                     {ok:,}")
@@ -275,3 +232,4 @@ def fuel_efficiency_audit():
 
 if __name__ == "__main__":
     fuel_efficiency_audit()
+

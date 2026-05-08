@@ -14,9 +14,14 @@ spark = get_spark("Vehicle Gold Layer")
 
 def vehicle_gold():
     try:
-        # -----------------------------
-        # 1. Read Silver tables
-        # -----------------------------
+        # Step 0: Ensure both the Registry and Assignment Silver tables are ready before attempting to build Gold datasets.
+        for name, path in {"Registry": REGISTRY_SILVER, "Assignment": ASSIGNMENT_SILVER}.items():
+            if not DeltaTable.isDeltaTable(spark, path):
+                msg = f"Required table '{name}' not found at {path}. Cannot proceed."
+                logger.error(msg)
+                raise RuntimeError(msg)
+
+        # Step 1: Load the clean, validated data from the Silver layer.
         registry_df = spark.read.format("delta").load(REGISTRY_SILVER)
         assignment_df = spark.read.format("delta").load(ASSIGNMENT_SILVER)
         
@@ -24,10 +29,13 @@ def vehicle_gold():
         asg_count = assignment_df.count()
         logger.info(f"Registry rows: {reg_count}, Assignment rows: {asg_count}")
 
-        # ====================================
-        # 2. Asset History SCD2 (FULL HISTORY)
-        # ====================================
-        # Export complete SCD2 history for compliance & audit trails
+        if asg_count == 0:
+            msg = "Assignment table is empty. Nothing to export."
+            logger.error(msg)
+            raise RuntimeError(msg)
+
+        # Step 2: Build the full Asset History dataset.
+        # This table maintains the complete, continuous historical record (SCD Type 2) of all vehicle assignments, which is crucial for compliance, auditing, and time-travel queries.
         asset_history = assignment_df.select(
             col("vin"),
             col("driver_id"),
@@ -54,31 +62,42 @@ def vehicle_gold():
 
         DeltaTable.forPath(spark, GOLD_ASSET_HISTORY).optimize().executeZOrderBy("vin", "start_date")
         DeltaTable.forPath(spark, GOLD_ASSET_HISTORY).vacuum(168.0)
-        logger.info("✅ Asset History SCD2 merged and optimized")
+        logger.info("Asset History SCD2 merged and optimized")
 
-        # ====================================
-        # 3. Active Fleet Snapshot (DAILY REPORT)
-        # ====================================
-        active_df = assignment_df \
-            .filter(col("status") == "IN-TRANSIT") \
-            .join(registry_df, "vin", how="inner")
+        # Step 3: Generate the Active Fleet Snapshot.
+        # This provides a real-time, aggregated view of the fleet, showing exactly how many vehicles of each model are currently "IN-TRANSIT".
+        active_df = assignment_df.filter(col("status") == "IN-TRANSIT")
+        active_count = active_df.count()
 
-        snapshot = active_df.groupBy("model") \
-            .agg(count("*").alias("no_of_active_vehicles")) \
-            .withColumn("snapshot_time", current_timestamp()) \
-            .orderBy(col("no_of_active_vehicles").desc())
-        
-        if not DeltaTable.isDeltaTable(spark, GOLD_FLEET_SNAPSHOT):
-            logger.info(f"Creating {GOLD_FLEET_SNAPSHOT}...")
-            snapshot.write.format("delta").mode("overwrite").save(GOLD_FLEET_SNAPSHOT)
-            spark.sql(f"ALTER TABLE delta.`{GOLD_FLEET_SNAPSHOT}` SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
+        if active_count == 0 or reg_count == 0:
+            logger.warning(f" No active vehicles ({active_count}) or empty registry ({reg_count}). "
+                           f"Skipping fleet snapshot.")
+            print(" Fleet snapshot: SKIPPED (no active vehicles or empty registry)")
         else:
-            logger.info(f"Overwriting {GOLD_FLEET_SNAPSHOT} (daily snapshot)...")
-            snapshot.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(GOLD_FLEET_SNAPSHOT)
+            active_df = active_df.join(registry_df, "vin", how="inner")
 
-        DeltaTable.forPath(spark, GOLD_FLEET_SNAPSHOT).optimize().executeZOrderBy("model")
-        DeltaTable.forPath(spark, GOLD_FLEET_SNAPSHOT).vacuum(168.0)
-        logger.info("✅ Active Fleet Snapshot overwritten and optimized")
+            snapshot = active_df.groupBy("model") \
+                .agg(count("*").alias("no_of_active_vehicles")) \
+                .withColumn("snapshot_time", current_timestamp()) \
+                .orderBy(col("no_of_active_vehicles").desc())
+            
+            if not DeltaTable.isDeltaTable(spark, GOLD_FLEET_SNAPSHOT):
+                logger.info(f"Creating {GOLD_FLEET_SNAPSHOT}...")
+                snapshot.write.format("delta").mode("overwrite").save(GOLD_FLEET_SNAPSHOT)
+                spark.sql(f"ALTER TABLE delta.`{GOLD_FLEET_SNAPSHOT}` SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
+            else:
+                logger.info(f"Merging into {GOLD_FLEET_SNAPSHOT}...")
+                target_table = DeltaTable.forPath(spark, GOLD_FLEET_SNAPSHOT)
+                target_table.alias("t").merge(
+                    snapshot.alias("s"),
+                    "t.model = s.model"
+                ).whenMatchedUpdateAll() \
+                 .whenNotMatchedInsertAll() \
+                 .execute()
+
+            DeltaTable.forPath(spark, GOLD_FLEET_SNAPSHOT).optimize().executeZOrderBy("model")
+            DeltaTable.forPath(spark, GOLD_FLEET_SNAPSHOT).vacuum(168.0)
+            logger.info(" Active Fleet Snapshot merged and optimized")
         
         # Log summary
         print("\n===== GOLD LAYER SUMMARY =====")
@@ -92,12 +111,12 @@ def vehicle_gold():
         except Exception:
             snapshot_count = 0
 
-        print(f"✅ Asset History SCD2: {history_count} records")
-        print(f"✅ Active Fleet Snapshot: {snapshot_count} models")
-        print("✅ Gold Layer Ready")
+        print(f" Asset History SCD2: {history_count} records")
+        print(f" Active Fleet Snapshot: {snapshot_count} models")
+        print("Gold Layer Ready")
         
     except Exception as e:
-        logger.error(f"❌ Error in vehicle_gold: {str(e)}")
+        logger.error(f" Error in vehicle_gold: {str(e)}")
         raise
 
 if __name__ == "__main__":
