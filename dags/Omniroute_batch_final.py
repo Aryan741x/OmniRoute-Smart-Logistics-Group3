@@ -144,6 +144,13 @@ def emr_step(name, script_path, script_args=""):
         }
     }]
 
+def is_last_day_of_month(d):
+    next_day = d + timedelta(days=1)
+    return next_day.month != d.month
+
+def is_last_day_of_year(d):
+    next_year = d + timedelta(days=1)
+    return next_year.year != d.year
 
 def add_step_and_wait(dag, task_id, script_path, step_name, script_args=""):
     """Helper to create an EmrAddSteps + EmrStepSensor pair.
@@ -181,7 +188,7 @@ default_args = {
 with DAG(
     dag_id="omniroute_batch_final",
     default_args=default_args,
-    start_date=datetime(2026, 1, 1),
+    start_date=datetime(2025, 12, 31),
     schedule_interval="0 0,5,7 * * *",  # BRD: 00:00 UTC and 07:00 UTC
     catchup=False,
     tags=["omniroute", "batch", "delta-lake"],
@@ -320,7 +327,7 @@ with DAG(
     # ============================================
     def check_first_of_month(**kwargs):
         execution_date = kwargs.get("logical_date") or kwargs.get("execution_date")
-        if execution_date.day == 1:
+        if is_last_day_of_month(execution_date):
             return "gold_driver_standing"
         return "skip_monthly"
 
@@ -393,13 +400,13 @@ with DAG(
         # Scheduled / logical_date based routing
         hour = execution_date.hour
         tasks = []
-        if hour == 0:
+        if hour == 7:
             tasks.extend(["bronze_registry", "bronze_assignment"])
-            if execution_date.month == 1 and execution_date.day == 1:
+            if is_last_day_of_year(execution_date):
                 tasks.append("bronze_maintenance")
-        elif hour == 7:
-            tasks.append("bronze_fuel")
         elif hour == 5:
+            tasks.append("bronze_fuel")
+        elif hour == 0:
             tasks.append("export_postgres_5")
 
         return tasks if tasks else ["skip_all"]
